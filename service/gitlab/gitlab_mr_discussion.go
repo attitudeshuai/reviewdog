@@ -44,6 +44,24 @@ type MergeRequestDiscussionCommenter struct {
 	// Keyed by fingerprint; value is a slice so fingerprint collisions across
 	// discussions do not silently drop entries.
 	outdatedDiscussions map[string][]string // fingerprint -> []discussionID
+
+	wsMu             sync.Mutex
+	suggestionSource *commentutil.WorkspaceSource
+}
+
+// workspaceSource returns the per-run source of workspace lines used to
+// supplement suggestion source lines missing from the diff context. It
+// returns nil when the git root cannot be determined, in which case
+// suggestion building keeps its historical behavior.
+func (g *MergeRequestDiscussionCommenter) workspaceSource() *commentutil.WorkspaceSource {
+	g.wsMu.Lock()
+	defer g.wsMu.Unlock()
+	if g.suggestionSource == nil {
+		if root, err := serviceutil.GetGitRoot(); err == nil {
+			g.suggestionSource = commentutil.NewWorkspaceSource(root)
+		}
+	}
+	return g.suggestionSource
 }
 
 // NewGitLabMergeRequestDiscussionCommenter returns a new MergeRequestDiscussionCommenter service.
@@ -135,6 +153,7 @@ func (g *MergeRequestDiscussionCommenter) postCommentsForEach(ctx context.Contex
 		return err
 	}
 
+	ws := g.workspaceSource()
 	var eg errgroup.Group
 	for _, c := range g.postComments {
 		c := c
@@ -152,7 +171,7 @@ func (g *MergeRequestDiscussionCommenter) postCommentsForEach(ctx context.Contex
 			continue
 		}
 		body := commentutil.MarkdownComment(c)
-		if suggestion := buildSuggestions(c); suggestion != "" {
+		if suggestion := buildSuggestions(c, ws); suggestion != "" {
 			body = body + "\n\n" + suggestion
 		}
 		body += fmt.Sprintf("\n%s\n", serviceutil.BuildMetaComment(fprint, g.toolName))
@@ -244,14 +263,14 @@ func listAllMergeRequestDiscussion(cli *gitlab.Client, projectID string, mergeRe
 
 // creates diff in markdown for suggested changes
 // Ref gitlab suggestion: https://docs.gitlab.com/ee/user/project/merge_requests/reviews/suggestions.html
-func buildSuggestions(c *reviewdog.Comment) string {
+func buildSuggestions(c *reviewdog.Comment, ws *commentutil.WorkspaceSource) string {
 	var sb strings.Builder
 	for _, s := range c.Result.Diagnostic.GetSuggestions() {
 		if s.Range == nil || s.Range.Start == nil {
 			continue
 		}
 
-		txt, err := buildSingleSuggestion(c, s)
+		txt, err := buildSingleSuggestion(c, s, ws)
 		if err != nil {
 			sb.WriteString(invalidSuggestionPre + err.Error() + invalidSuggestionPost + "\n")
 			continue
@@ -263,11 +282,11 @@ func buildSuggestions(c *reviewdog.Comment) string {
 	return sb.String()
 }
 
-func buildSingleSuggestion(c *reviewdog.Comment, s *rdf.Suggestion) (string, error) {
+func buildSingleSuggestion(c *reviewdog.Comment, s *rdf.Suggestion, ws *commentutil.WorkspaceSource) (string, error) {
 	start := s.GetRange().GetStart()
 	end := s.GetRange().GetEnd()
 	if start.GetColumn() > 0 || end.GetColumn() > 0 {
-		return buildNonLineBasedSuggestion(c, s)
+		return buildNonLineBasedSuggestion(c, s, ws)
 	}
 
 	var sb strings.Builder
@@ -304,8 +323,8 @@ func buildSingleSuggestion(c *reviewdog.Comment, s *rdf.Suggestion) (string, err
 	return sb.String(), nil
 }
 
-func buildNonLineBasedSuggestion(c *reviewdog.Comment, s *rdf.Suggestion) (string, error) {
-	txt, err := commentutil.BuildSuggestionText(c.Result.SourceLines, s)
+func buildNonLineBasedSuggestion(c *reviewdog.Comment, s *rdf.Suggestion, ws *commentutil.WorkspaceSource) (string, error) {
+	txt, err := ws.SuggestionText(c.Result.SourceLines, c.Result.Diagnostic.GetLocation().GetPath(), s)
 	if err != nil {
 		return "", err
 	}

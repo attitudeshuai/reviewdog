@@ -72,7 +72,7 @@ func TestBuildNonLineBasedSuggestionRangeEndOmitted(t *testing.T) {
 		Text: "X",
 	}
 
-	got, err := buildNonLineBasedSuggestion(c, s)
+	got, err := buildNonLineBasedSuggestion(c, s, nil)
 	if err != nil {
 		t.Fatalf("buildNonLineBasedSuggestion() error = %v", err)
 	}
@@ -94,13 +94,101 @@ func TestBuildNonLineBasedSuggestionRangeEndLineOmitted(t *testing.T) {
 		Text: "X",
 	}
 
-	got, err := buildNonLineBasedSuggestion(c, s)
+	got, err := buildNonLineBasedSuggestion(c, s, nil)
 	if err != nil {
 		t.Fatalf("buildNonLineBasedSuggestion() error = %v", err)
 	}
 	want := "```suggestion\nabXe\n```"
 	if got != want {
 		t.Fatalf("buildNonLineBasedSuggestion() = %q, want %q", got, want)
+	}
+}
+
+func workspaceSuggestionFixture(t *testing.T) (*commentutil.WorkspaceSource, string) {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "ws.go"),
+		[]byte(strings.Repeat("line\n", 14)+"alpha bravo\ncharlie delta\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return commentutil.NewWorkspaceSource(root), root
+}
+
+func TestBuildNonLineBasedSuggestion_SupplementedFromWorkspace(t *testing.T) {
+	ws, _ := workspaceSuggestionFixture(t)
+	c := &reviewdog.Comment{Result: &filter.FilteredDiagnostic{
+		SourceLines: map[int]string{15: "alpha bravo"}, // end line is missing from the diff context
+		Diagnostic:  &rdf.Diagnostic{Location: &rdf.Location{Path: "ws.go"}},
+	}}
+	s := &rdf.Suggestion{
+		Range: &rdf.Range{
+			Start: &rdf.Position{Line: 15, Column: 7},
+			End:   &rdf.Position{Line: 16, Column: 9},
+		},
+		Text: "X",
+	}
+
+	got, err := buildNonLineBasedSuggestion(c, s, ws)
+	if err != nil {
+		t.Fatalf("buildNonLineBasedSuggestion() error = %v", err)
+	}
+	if want := "```suggestion\nalpha Xdelta\n```"; got != want {
+		t.Fatalf("buildNonLineBasedSuggestion() = %q, want %q", got, want)
+	}
+}
+
+func TestBuildSuggestions_WorkspaceMissingFile(t *testing.T) {
+	ws, _ := workspaceSuggestionFixture(t)
+	c := &reviewdog.Comment{Result: &filter.FilteredDiagnostic{
+		Diagnostic: &rdf.Diagnostic{
+			Location: &rdf.Location{
+				Path: "missing.go",
+				Range: &rdf.Range{
+					Start: &rdf.Position{Line: 1},
+					End:   &rdf.Position{Line: 1},
+				},
+			},
+			Suggestions: []*rdf.Suggestion{{
+				Range: &rdf.Range{
+					Start: &rdf.Position{Line: 1, Column: 1},
+					End:   &rdf.Position{Line: 1, Column: 2},
+				},
+			}},
+		},
+	}}
+
+	got := buildSuggestions(c, ws)
+	if want := invalidSuggestionPre + `source file "missing.go" is not found in the workspace` + invalidSuggestionPost + "\n"; got != want {
+		t.Fatalf("buildSuggestions() = %q, want %q", got, want)
+	}
+}
+
+func TestBuildSingleSuggestion_LineBasedDoesNotReadWorkspace(t *testing.T) {
+	ws, _ := workspaceSuggestionFixture(t)
+	// The file does not exist in the workspace, but line-based suggestions
+	// never read source lines, so this must not fail.
+	c := &reviewdog.Comment{Result: &filter.FilteredDiagnostic{
+		Diagnostic: &rdf.Diagnostic{
+			Location: &rdf.Location{
+				Path:  "missing.go",
+				Range: &rdf.Range{Start: &rdf.Position{Line: 15}},
+			},
+			Suggestions: []*rdf.Suggestion{{
+				Range: &rdf.Range{
+					Start: &rdf.Position{Line: 15},
+					End:   &rdf.Position{Line: 15},
+				},
+				Text: "replacement",
+			}},
+		},
+	}}
+
+	got, err := buildSingleSuggestion(c, c.Result.Diagnostic.GetSuggestions()[0], ws)
+	if err != nil {
+		t.Fatalf("buildSingleSuggestion() error = %v", err)
+	}
+	if want := "```suggestion\nreplacement\n```"; got != want {
+		t.Fatalf("buildSingleSuggestion() = %q, want %q", got, want)
 	}
 }
 
@@ -399,14 +487,16 @@ https://test/repo/path/blob/sha/reviewdog.go#L18
 				}, "\n") + "\n"),
 			},
 			{
-				Path:      new("reviewdog.go"),
+				Path:      new("ws.go"),
 				Side:      new("RIGHT"),
 				StartSide: new("RIGHT"),
 				StartLine: new(15),
 				Line:      new(16),
 				Body: new(commentutil.BodyPrefix + strings.Join([]string{
-					"non-line based suggestion comment (no source lines)",
-					invalidSuggestionPre + "source lines are not available" + invalidSuggestionPost,
+					"non-line based suggestion comment (lines supplemented from workspace)",
+					"```suggestion",
+					"alpha Xdelta",
+					"```",
 					"",
 					"<!-- __reviewdog__:xxxxxxxxxx -->",
 				}, "\n") + "\n"),
@@ -595,6 +685,14 @@ https://test/repo/path/blob/sha/reviewdog.go#L18
 
 	cli := newGitHubClient(t, ts.URL)
 	g := NewGitHubPullRequest(cli, "o", "r", 14, "sha", "warning", "tool-name")
+	// Provide a workspace source so suggestions whose lines are missing from
+	// the diff context are supplemented from workspace files.
+	wsRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wsRoot, "ws.go"),
+		[]byte(strings.Repeat("line\n", 14)+"alpha bravo\ncharlie delta\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g.suggestionSource = commentutil.NewWorkspaceSource(wsRoot)
 	comments := []*reviewdog.Comment{
 		{
 			Result: &filter.FilteredDiagnostic{
@@ -963,7 +1061,7 @@ https://test/repo/path/blob/sha/reviewdog.go#L18
 			Result: &filter.FilteredDiagnostic{
 				Diagnostic: &rdf.Diagnostic{
 					Location: &rdf.Location{
-						Path: "reviewdog.go",
+						Path: "ws.go",
 						Range: &rdf.Range{
 							Start: &rdf.Position{
 								Line: 15,
@@ -978,17 +1076,17 @@ https://test/repo/path/blob/sha/reviewdog.go#L18
 							Range: &rdf.Range{
 								Start: &rdf.Position{
 									Line:   15,
-									Column: 5,
+									Column: 7,
 								},
 								End: &rdf.Position{
 									Line:   16,
-									Column: 7,
+									Column: 9,
 								},
 							},
-							Text: "replacement",
+							Text: "X",
 						},
 					},
-					Message: "non-line based suggestion comment (no source lines)",
+					Message: "non-line based suggestion comment (lines supplemented from workspace)",
 				},
 				InDiffFile:    true,
 				InDiffContext: true,

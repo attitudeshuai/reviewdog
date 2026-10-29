@@ -62,6 +62,24 @@ type PullRequest struct {
 	prCommentWithReply    map[int64]bool                      // review id -> bool
 	postedIssueComments   map[string]bool                     // fingerprint -> posted
 	outdatedIssueComments map[string]*gitea.Comment           // fingerprint -> comment
+
+	wsMu             sync.Mutex
+	suggestionSource *commentutil.WorkspaceSource
+}
+
+// workspaceSource returns the per-run source of workspace lines used to
+// supplement suggestion source lines missing from the diff context. It
+// returns nil when the git root cannot be determined, in which case
+// suggestion building keeps its historical behavior.
+func (g *PullRequest) workspaceSource() *commentutil.WorkspaceSource {
+	g.wsMu.Lock()
+	defer g.wsMu.Unlock()
+	if g.suggestionSource == nil {
+		if root, err := serviceutil.GetGitRoot(); err == nil {
+			g.suggestionSource = commentutil.NewWorkspaceSource(root)
+		}
+	}
+	return g.suggestionSource
 }
 
 // NewGiteaPullRequest returns a new PullRequest service.
@@ -175,14 +193,14 @@ func (g *PullRequest) postAsReviewComment(ctx context.Context) error {
 				remaining = append(remaining, c)
 				continue
 			}
-			comment := buildReviewComment(c, buildBody(c, repoBaseHTMLURL, rootPath, fprint, g.toolName))
+			comment := buildReviewComment(c, buildBody(c, repoBaseHTMLURL, rootPath, fprint, g.toolName, g.workspaceSource()))
 			reviewComments = append(reviewComments, comment)
 		} else {
 			if len(fileComments) >= maxFileComments {
 				remaining = append(remaining, c)
 				continue
 			}
-			comment := gitea.CreateIssueCommentOption{Body: buildBody(c, repoBaseHTMLURL, rootPath, fprint, g.toolName)}
+			comment := gitea.CreateIssueCommentOption{Body: buildBody(c, repoBaseHTMLURL, rootPath, fprint, g.toolName, g.workspaceSource())}
 			fileComments = append(fileComments, comment)
 		}
 	}
@@ -473,10 +491,10 @@ func listAllIssueComments(ctx context.Context, cli *gitea.Client,
 	return append(comments, restComments...), nil
 }
 
-func buildBody(c *reviewdog.Comment, baseURL string, gitRootPath string, fprint string, toolName string) string {
+func buildBody(c *reviewdog.Comment, baseURL string, gitRootPath string, fprint string, toolName string, ws *commentutil.WorkspaceSource) string {
 	cbody := commentutil.MarkdownComment(c)
 	if c.Result.InDiffContext {
-		if suggestion := buildSuggestions(c); suggestion != "" {
+		if suggestion := buildSuggestions(c, ws); suggestion != "" {
 			cbody += "\n" + suggestion
 		}
 	} else {
@@ -509,10 +527,10 @@ func giteaCodeSnippetURL(baseURL, gitRootPath string, loc *rdf.Location) string 
 	return relatedURL
 }
 
-func buildSuggestions(c *reviewdog.Comment) string {
+func buildSuggestions(c *reviewdog.Comment, ws *commentutil.WorkspaceSource) string {
 	var sb strings.Builder
 	for _, s := range c.Result.Diagnostic.GetSuggestions() {
-		txt, err := buildSingleSuggestion(c, s)
+		txt, err := buildSingleSuggestion(c, s, ws)
 		if err != nil {
 			sb.WriteString(invalidSuggestionPre + err.Error() + invalidSuggestionPost + "\n")
 			continue
@@ -523,7 +541,7 @@ func buildSuggestions(c *reviewdog.Comment) string {
 	return sb.String()
 }
 
-func buildSingleSuggestion(c *reviewdog.Comment, s *rdf.Suggestion) (string, error) {
+func buildSingleSuggestion(c *reviewdog.Comment, s *rdf.Suggestion, ws *commentutil.WorkspaceSource) (string, error) {
 	start := s.GetRange().GetStart()
 	startLine := int(start.GetLine())
 	end := s.GetRange().GetEnd()
@@ -539,7 +557,7 @@ func buildSingleSuggestion(c *reviewdog.Comment, s *rdf.Suggestion) (string, err
 			gStart, gEnd, startLine, endLine)
 	}
 	if start.GetColumn() > 0 || end.GetColumn() > 0 {
-		return buildNonLineBasedSuggestion(c, s)
+		return buildNonLineBasedSuggestion(c, s, ws)
 	}
 
 	txt := s.GetText()
@@ -557,8 +575,8 @@ func buildSingleSuggestion(c *reviewdog.Comment, s *rdf.Suggestion) (string, err
 	return sb.String(), nil
 }
 
-func buildNonLineBasedSuggestion(c *reviewdog.Comment, s *rdf.Suggestion) (string, error) {
-	txt, err := commentutil.BuildSuggestionText(c.Result.SourceLines, s)
+func buildNonLineBasedSuggestion(c *reviewdog.Comment, s *rdf.Suggestion, ws *commentutil.WorkspaceSource) (string, error) {
+	txt, err := ws.SuggestionText(c.Result.SourceLines, c.Result.Diagnostic.GetLocation().GetPath(), s)
 	if err != nil {
 		return "", err
 	}

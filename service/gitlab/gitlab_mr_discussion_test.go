@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,7 +30,7 @@ func metaBody(t *testing.T, c *reviewdog.Comment, toolName string) string {
 		t.Fatal(err)
 	}
 	body := commentutil.MarkdownComment(c)
-	if suggestion := buildSuggestions(c); suggestion != "" {
+	if suggestion := buildSuggestions(c, nil); suggestion != "" {
 		body += "\n\n" + suggestion
 	}
 	body += "\n" + serviceutil.BuildMetaComment(fprint, toolName) + "\n"
@@ -908,7 +909,7 @@ func TestBuildSuggestions(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		suggestion := buildSuggestions(tt.in)
+		suggestion := buildSuggestions(tt.in, nil)
 		if suggestion != tt.want {
 			t.Errorf("got unexpected suggestion.\ngot:\n%s\nwant:\n%s", suggestion, tt.want)
 		}
@@ -940,7 +941,7 @@ func TestBuildSuggestionsInvalid(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		suggestion := buildSuggestions(tt.in)
+		suggestion := buildSuggestions(tt.in, nil)
 		if suggestion != tt.want {
 			t.Errorf("got unexpected suggestion.\ngot:\n%s\nwant:\n%s", suggestion, tt.want)
 		}
@@ -1019,7 +1020,7 @@ func TestBuildSuggestionsRangeEndOmitted(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		suggestion := buildSuggestions(tt.in)
+		suggestion := buildSuggestions(tt.in, nil)
 		if suggestion != tt.want {
 			t.Errorf("got unexpected suggestion.\ngot:\n%s\nwant:\n%s", suggestion, tt.want)
 		}
@@ -1074,6 +1075,137 @@ func buildTestCommentWithSource(message string, source map[int]string, suggestio
 		Result: &filter.FilteredDiagnostic{
 			SourceLines: source,
 			Diagnostic: &rdf.Diagnostic{
+				Message:     message,
+				Suggestions: suggestions,
+			},
+		},
+	}
+}
+
+func workspaceTestSource(t *testing.T) *commentutil.WorkspaceSource {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "ws.go"),
+		[]byte(strings.Repeat("line\n", 14)+"alpha bravo\ncharlie delta\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return commentutil.NewWorkspaceSource(root)
+}
+
+func TestBuildSuggestionsSupplementFromWorkspace(t *testing.T) {
+	ws := workspaceTestSource(t)
+	// Diagnostic outside the diff context: no source lines were collected,
+	// but GitLab discussions still attach suggestions. Lines are supplemented
+	// from the workspace instead of degrading into an error block.
+	in := &reviewdog.Comment{
+		ToolName: "tool-name",
+		Result: &filter.FilteredDiagnostic{
+			Diagnostic: &rdf.Diagnostic{
+				Location: &rdf.Location{
+					Path:  "ws.go",
+					Range: &rdf.Range{Start: &rdf.Position{Line: 15}},
+				},
+				Suggestions: []*rdf.Suggestion{
+					buildTestsNonLineSuggestion("X", 15, 7, 16, 9),
+				},
+			},
+		},
+	}
+
+	got := buildSuggestions(in, ws)
+	want := strings.Join([]string{
+		"```suggestion:-0+1",
+		"alpha Xdelta",
+		"```",
+		"",
+	}, "\n")
+	if got != want {
+		t.Errorf("got unexpected suggestion.\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestBuildSuggestionsSupplementDiffLineWins(t *testing.T) {
+	ws := workspaceTestSource(t)
+	// The start line comes from the diff and must stay verbatim even though
+	// the workspace file contains different content.
+	in := &reviewdog.Comment{
+		ToolName: "tool-name",
+		Result: &filter.FilteredDiagnostic{
+			SourceLines: map[int]string{15: "alpha bravo"},
+			Diagnostic: &rdf.Diagnostic{
+				Location: &rdf.Location{Path: "ws.go"},
+				Suggestions: []*rdf.Suggestion{
+					buildTestsNonLineSuggestion("X", 15, 7, 16, 9),
+				},
+			},
+		},
+	}
+	got := buildSuggestions(in, ws)
+	if !strings.Contains(got, "alpha Xdelta") {
+		t.Errorf("suggestion = %q, want supplemented block with diff-provided start line", got)
+	}
+}
+
+func TestBuildSuggestionsWorkspaceMissingFile(t *testing.T) {
+	ws := workspaceTestSource(t)
+	in := buildTestCommentAtPath("missing in workspace", "missing.go",
+		[]*rdf.Suggestion{buildTestsNonLineSuggestion("X", 1, 1, 1, 2)})
+	got := buildSuggestions(in, ws)
+	want := invalidSuggestionPre + `source file "missing.go" is not found in the workspace` + invalidSuggestionPost + "\n"
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestBuildSuggestionsWorkspaceLineOutOfRange(t *testing.T) {
+	ws := workspaceTestSource(t)
+	in := buildTestCommentAtPath("line out of range", "ws.go",
+		[]*rdf.Suggestion{buildTestsNonLineSuggestion("X", 100, 1, 101, 1)})
+	got := buildSuggestions(in, ws)
+	want := invalidSuggestionPre + `source line (L=101) is out of range in workspace file "ws.go"` + invalidSuggestionPost + "\n"
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestBuildSuggestionsWorkspaceUnsafePathKeepsHistoricalError(t *testing.T) {
+	ws := workspaceTestSource(t)
+	// Empty path (e.g. older callers without location data) must not be read
+	// and keeps the historical error.
+	in := buildTestComment("no path", []*rdf.Suggestion{
+		buildTestsNonLineSuggestion("baz", 10, 5, 10, 8),
+	})
+	got := buildSuggestions(in, ws)
+	want := invalidSuggestionPre + "source lines are not available" + invalidSuggestionPost + "\n"
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestBuildSuggestionsLineBasedDoesNotReadWorkspace(t *testing.T) {
+	ws := workspaceTestSource(t)
+	// The file is absent from the workspace, but line-based suggestions use
+	// the suggestion text directly and must not read source lines.
+	in := buildTestCommentAtPath("line based", "missing.go",
+		[]*rdf.Suggestion{buildTestsSuggestion("fixed", 10, 10)})
+	got := buildSuggestions(in, ws)
+	want := strings.Join([]string{
+		"```suggestion:-0+0",
+		"fixed",
+		"```",
+		"",
+	}, "\n")
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func buildTestCommentAtPath(message, path string, suggestions []*rdf.Suggestion) *reviewdog.Comment {
+	return &reviewdog.Comment{
+		ToolName: "tool-name",
+		Result: &filter.FilteredDiagnostic{
+			Diagnostic: &rdf.Diagnostic{
+				Location:    &rdf.Location{Path: path},
 				Message:     message,
 				Suggestions: suggestions,
 			},
