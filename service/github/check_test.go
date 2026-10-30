@@ -14,6 +14,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-github/v93/github"
 	"github.com/reviewdog/reviewdog"
+	"github.com/reviewdog/reviewdog/diff"
 	"github.com/reviewdog/reviewdog/filter"
 	"github.com/reviewdog/reviewdog/proto/rdf"
 )
@@ -462,3 +463,164 @@ func TestCheck_update_retried_after_404(t *testing.T) {
 		})
 	}
 }
+
+func TestCheck_toCheckRunAnnotation_columns(t *testing.T) {
+	ch := &Check{ToolName: "tool"}
+	tests := []struct {
+		name          string
+		sourceLines   map[int]string
+		rng           *rdf.Range
+		wantStartLine int
+		wantEndLine   int
+		wantStartCol  *int
+		wantEndCol    *int
+	}{
+		{
+			name:        "in-bounds ascii columns attached",
+			sourceLines: map[int]string{1: "hello world"},
+			rng: &rdf.Range{
+				Start: &rdf.Position{Line: 1, Column: 7},
+				End:   &rdf.Position{Line: 1, Column: 12},
+			},
+			wantStartLine: 1, wantEndLine: 1,
+			wantStartCol: new(7), wantEndCol: new(12),
+		},
+		{
+			name:        "out-of-bounds columns clamp to line end",
+			sourceLines: map[int]string{1: "abc"},
+			rng: &rdf.Range{
+				Start: &rdf.Position{Line: 1, Column: 100},
+				End:   &rdf.Position{Line: 1, Column: 200},
+			},
+			wantStartLine: 1, wantEndLine: 1,
+			// "abc" is 3 bytes: both columns land at the line-end cursor (4).
+			wantStartCol: new(4), wantEndCol: new(4),
+		},
+		{
+			name:        "columns inside multi-byte runes expand outward",
+			sourceLines: map[int]string{1: "あいう"},
+			rng: &rdf.Range{
+				Start: &rdf.Position{Line: 1, Column: 2},
+				End:   &rdf.Position{Line: 1, Column: 5},
+			},
+			wantStartLine: 1, wantEndLine: 1,
+			wantStartCol: new(1), wantEndCol: new(7),
+		},
+		{
+			name:        "no source content falls back to line-level",
+			sourceLines: map[int]string{},
+			rng: &rdf.Range{
+				Start: &rdf.Position{Line: 1, Column: 100},
+				End:   &rdf.Position{Line: 1, Column: 200},
+			},
+			wantStartLine: 1, wantEndLine: 1,
+			wantStartCol: nil, wantEndCol: nil,
+		},
+		{
+			name:        "start column only is line-level",
+			sourceLines: map[int]string{1: "abc"},
+			rng: &rdf.Range{
+				Start: &rdf.Position{Line: 1, Column: 2},
+			},
+			wantStartLine: 1, wantEndLine: 1,
+			wantStartCol: nil, wantEndCol: nil,
+		},
+		{
+			name:        "multi-line range is line-level",
+			sourceLines: map[int]string{1: "abc", 2: "def"},
+			rng: &rdf.Range{
+				Start: &rdf.Position{Line: 1, Column: 1},
+				End:   &rdf.Position{Line: 2, Column: 4},
+			},
+			wantStartLine: 1, wantEndLine: 2,
+			wantStartCol: nil, wantEndCol: nil,
+		},
+		{
+			name:        "inverted interval is line-level",
+			sourceLines: map[int]string{1: "hello"},
+			rng: &rdf.Range{
+				Start: &rdf.Position{Line: 1, Column: 5},
+				End:   &rdf.Position{Line: 1, Column: 2},
+			},
+			wantStartLine: 1, wantEndLine: 1,
+			wantStartCol: nil, wantEndCol: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fd := &filter.FilteredDiagnostic{
+				SourceLines: tt.sourceLines,
+				Diagnostic: &rdf.Diagnostic{
+					Message:  "msg",
+					Location: &rdf.Location{Path: "f.txt", Range: tt.rng},
+				},
+			}
+			a := ch.toCheckRunAnnotation(fd)
+			if got := a.GetStartLine(); got != tt.wantStartLine {
+				t.Errorf("StartLine = %d, want %d", got, tt.wantStartLine)
+			}
+			if got := a.GetEndLine(); got != tt.wantEndLine {
+				t.Errorf("EndLine = %d, want %d", got, tt.wantEndLine)
+			}
+			if got := a.StartColumn; !ptrEqual(got, tt.wantStartCol) {
+				t.Errorf("StartColumn = %v, want %v", got, tt.wantStartCol)
+			}
+			if got := a.EndColumn; !ptrEqual(got, tt.wantEndCol) {
+				t.Errorf("EndColumn = %v, want %v", got, tt.wantEndCol)
+			}
+		})
+	}
+}
+
+func ptrEqual(got, want *int) bool {
+	if got == nil || want == nil {
+		return got == nil && want == nil
+	}
+	return *got == *want
+}
+
+// TestCheck_annotationColumnsConsistentWithDiagnostic ensures that when source
+// line content is available, the columns sent on a check-run annotation are
+// exactly the normalized columns the diagnostic carries (i.e. the same
+// columns the local summary and structured outputs report).
+func TestCheck_annotationColumnsConsistentWithDiagnostic(t *testing.T) {
+	filediffs, _ := diff.ParseMultiFile(strings.NewReader(diffContentForCheck))
+	diagnostic := &rdf.Diagnostic{
+		Message: "msg",
+		Location: &rdf.Location{
+			Path: "sample.new.txt",
+			Range: &rdf.Range{
+				Start: &rdf.Position{Line: 2, Column: 50},
+				End:   &rdf.Position{Line: 2, Column: 60},
+			},
+		},
+	}
+	checks := filter.FilterCheck([]*rdf.Diagnostic{diagnostic}, filediffs, 0, "", filter.ModeAdded)
+	fd := checks[0]
+
+	a := (&Check{ToolName: "tool"}).toCheckRunAnnotation(fd)
+	rng := fd.Diagnostic.GetLocation().GetRange()
+	if a.GetStartColumn() != int(rng.GetStart().GetColumn()) {
+		t.Errorf("annotation start column = %d, diagnostic column = %d",
+			a.GetStartColumn(), rng.GetStart().GetColumn())
+	}
+	if a.GetEndColumn() != int(rng.GetEnd().GetColumn()) {
+		t.Errorf("annotation end column = %d, diagnostic column = %d",
+			a.GetEndColumn(), rng.GetEnd().GetColumn())
+	}
+	// "added line" is 10 bytes, so columns must be in bounds: 11 is the
+	// line-end cursor.
+	if a.GetStartColumn() != 11 || a.GetEndColumn() != 11 {
+		t.Errorf("columns = (%d,%d), want (11,11)", a.GetStartColumn(), a.GetEndColumn())
+	}
+}
+
+const diffContentForCheck = `--- sample.old.txt	2016-10-13 05:09:35.820791185 +0900
++++ sample.new.txt	2016-10-13 05:15:26.839245048 +0900
+@@ -1,3 +1,4 @@
+ unchanged, contextual line
+-deleted line
++added line
++added line
+ unchanged, contextual line
+`

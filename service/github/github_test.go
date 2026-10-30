@@ -104,6 +104,83 @@ func TestBuildNonLineBasedSuggestionRangeEndLineOmitted(t *testing.T) {
 	}
 }
 
+// Out-of-bounds and mid-rune columns must not panic or interrupt reporting,
+// and every other suggestion of the same diagnostic must still be rendered.
+func TestBuildSuggestions_badColumnsDoNotInterrupt(t *testing.T) {
+	c := &reviewdog.Comment{Result: &filter.FilteredDiagnostic{
+		SourceLines: map[int]string{1: "あいう"},
+		Diagnostic: &rdf.Diagnostic{
+			Location: &rdf.Location{
+				Path:  "reviewdog.go",
+				Range: &rdf.Range{Start: &rdf.Position{Line: 1}, End: &rdf.Position{Line: 1}},
+			},
+			Suggestions: []*rdf.Suggestion{
+				{ // Columns way past the line end.
+					Range: &rdf.Range{
+						Start: &rdf.Position{Line: 1, Column: 100},
+						End:   &rdf.Position{Line: 1, Column: 200},
+					},
+					Text: "X",
+				},
+				{ // Columns inside multi-byte runes.
+					Range: &rdf.Range{
+						Start: &rdf.Position{Line: 1, Column: 2},
+						End:   &rdf.Position{Line: 1, Column: 3},
+					},
+					Text: "Y",
+				},
+			},
+		},
+	}}
+
+	got := buildSuggestions(c)
+	for _, want := range []string{"```suggestion\nあいうX\n```", "```suggestion\nYいう\n```"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("buildSuggestions() = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, invalidSuggestionPre) {
+		t.Errorf("buildSuggestions() = %q, want no suggestion error block", got)
+	}
+}
+
+// An unrenderable suggestion (no source content) degrades to a readable note
+// while sibling suggestions are still posted.
+func TestBuildSuggestions_unrenderableKeepsSiblings(t *testing.T) {
+	c := &reviewdog.Comment{Result: &filter.FilteredDiagnostic{
+		Diagnostic: &rdf.Diagnostic{
+			Location: &rdf.Location{
+				Path:  "reviewdog.go",
+				Range: &rdf.Range{Start: &rdf.Position{Line: 1}, End: &rdf.Position{Line: 1}},
+			},
+			Suggestions: []*rdf.Suggestion{
+				{
+					Range: &rdf.Range{
+						Start: &rdf.Position{Line: 1, Column: 2},
+						End:   &rdf.Position{Line: 1, Column: 3},
+					},
+					Text: "X",
+				},
+				{
+					Range: &rdf.Range{
+						Start: &rdf.Position{Line: 1},
+						End:   &rdf.Position{Line: 1},
+					},
+					Text: "linewise",
+				},
+			},
+		},
+	}}
+
+	got := buildSuggestions(c)
+	if !strings.Contains(got, invalidSuggestionPre+"source lines are not available"+invalidSuggestionPost) {
+		t.Errorf("buildSuggestions() = %q, want readable degradation note", got)
+	}
+	if !strings.Contains(got, "```suggestion\nlinewise\n```") {
+		t.Errorf("buildSuggestions() = %q, want sibling linewise suggestion", got)
+	}
+}
+
 func TestGitHubPullRequest_Post(t *testing.T) {
 	t.Skip("skipping test which post comments actually")
 	client := setupGitHubClient()

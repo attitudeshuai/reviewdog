@@ -84,6 +84,10 @@ func FilterCheck(results []*rdf.Diagnostic, diff []*diff.FileDiff, strip int,
 				check.FirstSuggestionInDiffContext = inDiffContext
 			}
 		}
+		// Correct the diagnostic's columns against the source lines we could
+		// resolve, so out-of-range or rune-splitting columns never reach
+		// reporters. Ranges without source content are left untouched.
+		NormalizeLocationColumns(result.GetLocation(), check.SourceLines)
 		checks = append(checks, check)
 	}
 	return checks

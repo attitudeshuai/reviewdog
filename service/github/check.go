@@ -223,16 +223,42 @@ func (ch *Check) toCheckRunAnnotation(c *filter.FilteredDiagnostic) *github.Chec
 		Title:           new(ch.buildTitle(c)),
 	}
 	// Annotations only support start_column and end_column on the same line.
+	// Attach columns only when a legal, in-bounds interval can be formed from
+	// known source content; otherwise report the annotation line-level so no
+	// out-of-range columns are sent to the Checks API.
 	if startLine == endLine {
-		if s, e := loc.GetRange().GetStart().GetColumn(), loc.GetRange().GetEnd().GetColumn(); s != 0 && e != 0 {
-			a.StartColumn = new(int(s))
-			a.EndColumn = new(int(e))
+		if sc, ec, ok := annotationColumns(c.SourceLines, startLine, loc.GetRange()); ok {
+			a.StartColumn = new(sc)
+			a.EndColumn = new(ec)
 		}
 	}
 	if s := c.Diagnostic.GetOriginalOutput(); s != "" {
 		a.RawDetails = new(s)
 	}
 	return a
+}
+
+// annotationColumns resolves a legal 1-based [startColumn, endColumn]
+// interval on a single line from the given source content. It returns ok
+// false when the source line content is unavailable, when either column is
+// omitted, or when the interval is inverted, so callers fall back to a
+// line-level annotation instead of sending out-of-range columns.
+func annotationColumns(sourceLines map[int]string, line int, rng *rdf.Range) (start, end int, ok bool) {
+	lineContent, exists := sourceLines[line]
+	if !exists {
+		return 0, 0, false
+	}
+	sc := rng.GetStart().GetColumn()
+	ec := rng.GetEnd().GetColumn()
+	if sc == 0 || ec == 0 {
+		return 0, 0, false
+	}
+	startOff := filter.StartByteOffset(lineContent, int(sc))
+	endOff := filter.EndByteOffset(lineContent, int(ec))
+	if startOff > endOff {
+		return 0, 0, false
+	}
+	return startOff + 1, endOff + 1, true
 }
 
 func (ch *Check) buildTitle(c *filter.FilteredDiagnostic) string {
