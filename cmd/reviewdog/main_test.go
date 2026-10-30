@@ -12,6 +12,60 @@ import (
 	"github.com/reviewdog/reviewdog/filter"
 )
 
+func TestValidateLevel(t *testing.T) {
+	t.Run("unrecognized level errors and points to the flag", func(t *testing.T) {
+		opt := &option{level: "loud"}
+		err := validateLevel(opt)
+		if err == nil {
+			t.Fatal("validateLevel() error = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "-level") {
+			t.Errorf("error %q does not identify the -level flag as the source", err)
+		}
+		if !strings.Contains(err.Error(), "loud") {
+			t.Errorf("error %q does not mention the invalid value", err)
+		}
+	})
+
+	t.Run("recognized and empty levels are canonicalized", func(t *testing.T) {
+		for _, tt := range []struct {
+			in   string
+			want string
+		}{
+			{"", ""},
+			{"   ", ""},
+			{"error", "error"},
+			{" Warning ", "warning"},
+			{"FATAL", "error"},
+			{"提示", "info"},
+		} {
+			opt := &option{level: tt.in}
+			if err := validateLevel(opt); err != nil {
+				t.Errorf("validateLevel(%q) unexpected error: %v", tt.in, err)
+			}
+			if opt.level != tt.want {
+				t.Errorf("validateLevel(%q) canonicalized to %q, want %q", tt.in, opt.level, tt.want)
+			}
+		}
+	})
+}
+
+func TestRun_invalidLevel(t *testing.T) {
+	opt := &option{
+		efms:       strslice([]string{`%f:%l:%c:%m`}),
+		reporter:   "local",
+		level:      "loud",
+		filterMode: filter.ModeNoFilter,
+	}
+	err := run(strings.NewReader(""), new(bytes.Buffer), opt)
+	if err == nil {
+		t.Fatal("run() error = nil, want invalid -level error at startup")
+	}
+	if !strings.Contains(err.Error(), "-level") {
+		t.Errorf("error %q does not identify the -level flag as the source", err)
+	}
+}
+
 func TestRun_local(t *testing.T) {
 	const (
 		before = `line1

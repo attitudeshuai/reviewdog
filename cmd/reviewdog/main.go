@@ -32,6 +32,7 @@ import (
 	"github.com/reviewdog/reviewdog/filter"
 	"github.com/reviewdog/reviewdog/parser"
 	"github.com/reviewdog/reviewdog/project"
+	"github.com/reviewdog/reviewdog/proto/rdf"
 	bbservice "github.com/reviewdog/reviewdog/service/bitbucket"
 	gerritservice "github.com/reviewdog/reviewdog/service/gerrit"
 	giteaservice "github.com/reviewdog/reviewdog/service/gitea"
@@ -289,6 +290,12 @@ func run(r io.Reader, w io.Writer, opt *option) error {
 
 	if opt.list {
 		return runList(w)
+	}
+
+	// Validate the report level from the command line at startup instead of
+	// letting reporters silently downgrade it or emit an "unknown level".
+	if err := validateLevel(opt); err != nil {
+		return err
 	}
 
 	if opt.tee {
@@ -1048,6 +1055,19 @@ func localDiffService(opt *option) (reviewdog.DiffService, error) {
 		return &reviewdog.EmptyDiff{}, nil
 	}
 	return diffService(opt.diffCmd, opt.diffStrip)
+}
+
+// validateLevel validates the -level command-line flag and canonicalizes it
+// (case, surrounding whitespace and synonyms) in place. An empty level means
+// "not specified" and stays valid; anything unrecognized is an error.
+func validateLevel(opt *option) error {
+	if l := opt.level; strings.TrimSpace(l) != "" && rdf.ParseSeverity(l) == rdf.Severity_UNKNOWN_SEVERITY {
+		return fmt.Errorf("invalid -level value %q: supported report levels are %q, %q and %q "+
+			"(case-insensitive; common synonyms such as fatal/critical/blocker, warn, note/hint "+
+			"are also accepted)", l, "info", "warning", "error")
+	}
+	opt.level = rdf.NormalizeLevel(opt.level)
+	return nil
 }
 
 func failLevel(opt *option) reviewdog.FailLevel {

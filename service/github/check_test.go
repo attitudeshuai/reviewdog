@@ -415,6 +415,69 @@ func TestCheck_setToolNameForEachRun(t *testing.T) {
 	}
 }
 
+func TestCheck_LevelMapping(t *testing.T) {
+	// The configured report level goes through the same severity word table
+	// as the inputs: synonyms, case and surrounding whitespace resolve to the
+	// same annotation level and check conclusion.
+	ann := []*github.CheckRunAnnotation{{AnnotationLevel: new("failure")}}
+	for _, tc := range []struct {
+		level          string
+		wantAnnotation string
+		wantConclusion string
+		wantEmptyConc  string // conclusion when there are no annotations
+	}{
+		{"error", "failure", "failure", "success"},
+		{"ERROR", "failure", "failure", "success"},
+		{" fatal ", "failure", "failure", "success"},
+		{"failure", "failure", "failure", "success"},
+		{"阻断", "failure", "failure", "success"},
+		{"warning", "warning", "neutral", "success"},
+		{" Warn ", "warning", "neutral", "success"},
+		{"警告", "warning", "neutral", "success"},
+		{"info", "notice", "neutral", "success"},
+		{"INFO", "notice", "neutral", "success"},
+		{" hint ", "notice", "neutral", "success"},
+		{"提示", "notice", "neutral", "success"},
+		// An unrecognized level (one an old doghouse client might still send)
+		// keeps the historical failure default.
+		{"loud", "failure", "failure", "success"},
+		// With no level configured, the conclusion is derived from the
+		// annotation levels (the fixture annotation is "failure").
+		{"", "failure", "failure", "success"},
+	} {
+		t.Run(tc.level, func(t *testing.T) {
+			ch := &Check{Level: tc.level}
+			if got := ch.reqAnnotationLevel(); got != tc.wantAnnotation {
+				t.Errorf("reqAnnotationLevel() = %q, want %q", got, tc.wantAnnotation)
+			}
+			if got := ch.conclusion(ann); got != tc.wantConclusion {
+				t.Errorf("conclusion(with annotations) = %q, want %q", got, tc.wantConclusion)
+			}
+			if got := ch.conclusion(nil); got != tc.wantEmptyConc {
+				t.Errorf("conclusion(no annotations) = %q, want %q", got, tc.wantEmptyConc)
+			}
+		})
+	}
+}
+
+func TestCheck_annotationLevel(t *testing.T) {
+	ch := &Check{Level: "warning"}
+	for _, tc := range []struct {
+		severity rdf.Severity
+		want     string
+	}{
+		{rdf.Severity_ERROR, "failure"},
+		{rdf.Severity_WARNING, "warning"},
+		{rdf.Severity_INFO, "notice"},
+		// Unknown diagnostic severity falls back to the configured level.
+		{rdf.Severity_UNKNOWN_SEVERITY, "warning"},
+	} {
+		if got := ch.annotationLevel(tc.severity); got != tc.want {
+			t.Errorf("annotationLevel(%v) = %q, want %q", tc.severity, got, tc.want)
+		}
+	}
+}
+
 func TestCheck_update_retried_after_404(t *testing.T) {
 	defer func(d time.Duration) { checkRunRetryDelay = d }(checkRunRetryDelay)
 	checkRunRetryDelay = time.Millisecond

@@ -284,16 +284,21 @@ func (ch *Check) postAnnotations(ctx context.Context, checkID int64, annotations
 func (ch *Check) conclusion(annotations []*github.CheckRunAnnotation) string {
 	checkResult := "success"
 
-	if ch.Level != "" {
+	if strings.TrimSpace(ch.Level) != "" {
 		// Level takes precedence when configured (for backwards compatibility)
 		if len(annotations) == 0 {
 			return checkResult
 		}
-		switch strings.ToLower(ch.Level) {
-		case "info", "warning":
+		// The report level goes through the same word table as the inputs, so
+		// synonyms, case and surrounding whitespace map to the same conclusion.
+		// Any unrecognized level keeps the historical "failure" default (e.g.
+		// levels sent by older reviewdog clients via the doghouse server).
+		switch rdf.ParseSeverity(ch.Level) {
+		case rdf.Severity_INFO, rdf.Severity_WARNING:
 			return "neutral"
+		default:
+			return "failure"
 		}
-		return "failure"
 	}
 
 	precedence := map[string]int{
@@ -349,15 +354,22 @@ func (ch *Check) annotationLevel(s rdf.Severity) string {
 	}
 }
 
+// reqAnnotationLevel resolves the configured report level to a GitHub Check
+// annotation level. It uses the same severity word table as the inputs, so
+// equivalent levels (info/warning/error, synonyms, case or whitespace variants)
+// map to equivalent annotation categories. info is represented as "notice"
+// because GitHub Check annotations have no dedicated info level.
 func (ch *Check) reqAnnotationLevel() string {
-	switch strings.ToLower(ch.Level) {
-	case "info":
+	switch rdf.ParseSeverity(ch.Level) {
+	case rdf.Severity_INFO:
 		return "notice"
-	case "warning":
+	case rdf.Severity_WARNING:
 		return "warning"
-	case "failure":
+	case rdf.Severity_ERROR:
 		return "failure"
 	}
+	// No (or unrecognized, e.g. from an old client) level: failure is the
+	// historical default annotation level.
 	return "failure"
 }
 

@@ -71,3 +71,63 @@ runner:
 	}
 
 }
+
+func TestParseLevel(t *testing.T) {
+	t.Run("synonyms and surrounding whitespace are accepted", func(t *testing.T) {
+		const yml = `
+runner:
+  fatalcheck:
+    cmd: echo fatal
+    level: Fatal
+  spacedcheck:
+    cmd: echo spaced
+    level: " warning "
+  hintcheck:
+    cmd: echo hint
+    level: 提示
+  nolevel:
+    cmd: echo none
+`
+		conf, err := Parse([]byte(yml))
+		if err != nil {
+			t.Fatalf("Parse() unexpected error: %v", err)
+		}
+		if got := conf.Runner["fatalcheck"].Level; got != "Fatal" {
+			t.Errorf("raw level preserved as %q, want %q", got, "Fatal")
+		}
+		if got := conf.Runner["spacedcheck"].Level; got != " warning " {
+			t.Errorf("raw level preserved as %q, want %q", got, " warning ")
+		}
+	})
+
+	t.Run("invalid level errors and names the runner", func(t *testing.T) {
+		const yml = `
+runner:
+  badcheck:
+    cmd: echo bad
+    level: urgencies-are-hard
+`
+		_, err := Parse([]byte(yml))
+		if err == nil {
+			t.Fatal("Parse() error = nil, want invalid level error")
+		}
+		if !strings.Contains(err.Error(), `urgencies-are-hard`) {
+			t.Errorf("error %q does not mention the invalid level value", err)
+		}
+		if !strings.Contains(err.Error(), `badcheck`) {
+			t.Errorf("error %q does not identify the runner (checker) source", err)
+		}
+	})
+
+	t.Run("empty level is accepted", func(t *testing.T) {
+		const yml = `
+runner:
+  ok:
+    cmd: echo ok
+    level: ""
+`
+		if _, err := Parse([]byte(yml)); err != nil {
+			t.Fatalf("Parse() unexpected error: %v", err)
+		}
+	})
+}

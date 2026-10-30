@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/reviewdog/reviewdog"
 	"github.com/reviewdog/reviewdog/filter"
@@ -330,6 +333,58 @@ func TestRun(t *testing.T) {
 			t.Fatalf("got %d diagnostics, want 1", len(result.Diagnostics))
 		}
 	})
+}
+
+func TestRunAndParseLevel(t *testing.T) {
+	// Per-runner levels and the command-line default level go through the same
+	// severity word table, are stored in canonical form, and a per-runner level
+	// takes precedence over the default. The result must be stable across runs.
+	newConf := func() *Config {
+		return &Config{Runner: map[string]*Runner{
+			"runner-level": {
+				Name:        "runner-level",
+				Cmd:         "echo 'f:1:1:m'",
+				Errorformat: []string{`%f:%l:%c:%m`},
+				Level:       " Fatal ", // synonym + whitespace -> error
+			},
+			"default-level": {
+				Name:        "default-level",
+				Cmd:         "echo 'f:1:1:m'",
+				Errorformat: []string{`%f:%l:%c:%m`},
+			},
+			"blank-level": {
+				Name:        "blank-level",
+				Cmd:         "echo 'f:1:1:m'",
+				Errorformat: []string{`%f:%l:%c:%m`},
+				Level:       "   ", // blank falls back to the default
+			},
+		}}
+	}
+
+	run := func() map[string]string {
+		results, err := RunAndParse(context.Background(), newConf(), nil, "Warning", false)
+		if err != nil {
+			t.Fatalf("RunAndParse failed: %v", err)
+		}
+		levels := make(map[string]string)
+		results.Range(func(name string, r *reviewdog.Result) {
+			levels[name] = r.Level
+		})
+		return levels
+	}
+
+	want := map[string]string{
+		"runner-level":  "error",   // per-runner level wins over the default
+		"default-level": "warning", // command-line default level, canonicalized
+		"blank-level":   "warning", // blank per-runner level falls back
+	}
+	first := run()
+	if diff := cmp.Diff(first, want); diff != "" {
+		t.Errorf("levels (-got +want):\n%s", diff)
+	}
+	if second := run(); !reflect.DeepEqual(first, second) {
+		t.Errorf("levels differ across runs:\nfirst:  %v\nsecond: %v", first, second)
+	}
 }
 
 func TestFilteredEnviron(t *testing.T) {

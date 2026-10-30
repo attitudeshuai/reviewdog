@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/reviewdog/reviewdog/proto/rdf"
 )
 
 // Config represents reviewdog config.
@@ -40,6 +42,16 @@ func Parse(yml []byte) (*Config, error) {
 		}
 		if runner.Name == "" {
 			runner.Name = name
+		}
+		// Validate the report level while loading the config so invalid
+		// values fail at startup instead of being silently downgraded (or
+		// rendered as an "unknown level") by reporters. The runner name is
+		// reported so users can tell which checker is wrong.
+		if l := runner.Level; l != "" && rdf.ParseSeverity(l) == rdf.Severity_UNKNOWN_SEVERITY {
+			return nil, fmt.Errorf("invalid level %q for runner %q in reviewdog config: "+
+				"supported levels are %q, %q and %q (case-insensitive, common synonyms such as "+
+				"fatal/critical/blocker, warn, note/hint are also accepted)",
+				l, runner.Name, "info", "warning", "error")
 		}
 	}
 	return out, nil

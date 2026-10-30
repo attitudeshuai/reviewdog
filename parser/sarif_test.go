@@ -192,6 +192,71 @@ func TestSarifParser_ResultKind(t *testing.T) {
 	}
 }
 
+func TestSarifParser_LevelSeverity(t *testing.T) {
+	// The structured SARIF result level uses the same severity word table as
+	// text inputs: synonyms, case and surrounding whitespace are recognized,
+	// unknown levels stay unknown, and the rule's defaultConfiguration level
+	// is inherited only when the result has no level of its own.
+	build := func(resultLevel, ruleLevel string) string {
+		resultLevelJSON := ""
+		if resultLevel != "" {
+			resultLevelJSON = fmt.Sprintf(`"level": %q,`, resultLevel)
+		}
+		ruleJSON := `{"id": "R1"`
+		if ruleLevel != "" {
+			ruleJSON += fmt.Sprintf(`, "defaultConfiguration": {"level": %q}`, ruleLevel)
+		}
+		ruleJSON += "}"
+		return `{
+			"version": "2.1.0",
+			"runs": [{
+				"tool": {"driver": {"name": "fixture", "rules": [` + ruleJSON + `]}},
+				"results": [{
+					` + resultLevelJSON + `"ruleId": "R1",
+					"message": {"text": "msg"},
+					"locations": [{"physicalLocation": {
+						"artifactLocation": {"uri": "main.go"},
+						"region": {"startLine": 1}
+					}}]
+				}]
+			}]
+		}`
+	}
+
+	for _, tc := range []struct {
+		name        string
+		resultLevel string
+		ruleLevel   string
+		want        rdf.Severity
+	}{
+		{name: "error", resultLevel: "error", want: rdf.Severity_ERROR},
+		{name: "fatal synonym with spaces", resultLevel: " Fatal ", want: rdf.Severity_ERROR},
+		{name: "critical synonym", resultLevel: "CRITICAL", want: rdf.Severity_ERROR},
+		{name: "warning", resultLevel: "warning", want: rdf.Severity_WARNING},
+		{name: "warn synonym", resultLevel: "warn", want: rdf.Severity_WARNING},
+		{name: "note is info", resultLevel: "note", want: rdf.Severity_INFO},
+		{name: "hint synonym", resultLevel: " hint ", want: rdf.Severity_INFO},
+		{name: "unknown stays unknown", resultLevel: "banana", want: rdf.Severity_UNKNOWN_SEVERITY},
+		{name: "none stays unknown", resultLevel: "none", want: rdf.Severity_UNKNOWN_SEVERITY},
+		{name: "inherit rule warning level", ruleLevel: "warning", want: rdf.Severity_WARNING},
+		{name: "inherit rule fatal synonym", ruleLevel: "fatal", want: rdf.Severity_ERROR},
+		{name: "result level takes precedence over rule", resultLevel: "error", ruleLevel: "warning", want: rdf.Severity_ERROR},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ds, err := NewSarifParser().Parse(strings.NewReader(build(tc.resultLevel, tc.ruleLevel)))
+			if err != nil {
+				t.Fatalf("Parse error: %v", err)
+			}
+			if len(ds) != 1 {
+				t.Fatalf("got %d diagnostics, want 1", len(ds))
+			}
+			if got := ds[0].GetSeverity(); got != tc.want {
+				t.Errorf("severity = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSarifParser_ReplacementInsertedContent(t *testing.T) {
 	// Regression test for https://github.com/reviewdog/reviewdog/issues/2808:
 	// ruff can emit a replacement without the optional insertedContent field.

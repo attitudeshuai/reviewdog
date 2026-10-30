@@ -61,22 +61,23 @@ func ReportAsGitHubActionsLog(toolName, defaultLevel string, d *rdf.Diagnostic) 
 		Col:  int(start.GetColumn()),
 	}
 
-	level := defaultLevel
-	switch d.Severity {
-	case rdf.Severity_ERROR:
-		level = "error"
-	case rdf.Severity_INFO, rdf.Severity_WARNING:
-		level = "warning"
+	// A diagnostic with an explicit severity wins; otherwise the configured
+	// default report level applies. Both go through the same severity word
+	// table as the GitHub Check reporter, so an equivalent level maps to an
+	// equivalent category here as well. Invalid default levels are rejected at
+	// startup, so they never reach this point.
+	severity := d.Severity
+	if severity == rdf.Severity_UNKNOWN_SEVERITY {
+		severity = rdf.ParseSeverity(defaultLevel)
 	}
 
-	switch level {
-	// no info command with location data.
-	case "warning", "info":
+	switch severity {
+	case rdf.Severity_INFO, rdf.Severity_WARNING:
+		// There is no info logging command with location data, so info is
+		// reported like warning (the historical behavior).
 		core.Warning(mes, opt)
-	case "error", "":
-		core.Error(mes, opt)
 	default:
-		core.Error(fmt.Sprintf("Unknown level: %s", level), nil)
+		// ERROR, or no/unknown default level: error is the historical default.
 		core.Error(mes, opt)
 	}
 }

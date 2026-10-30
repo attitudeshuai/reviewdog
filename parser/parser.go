@@ -59,16 +59,10 @@ func New(opt *Option) (Parser, error) {
 	return NewErrorformatParserString(opt.Errorformat)
 }
 
+// severity maps a checker-specific severity name (e.g. the checkstyle
+// severity attribute, the errorformat %t type, or the SARIF result level)
+// to rdf.Severity. All text and structured inputs share this single word
+// table. See rdf.ParseSeverity for the matching rules.
 func severity(s string) rdf.Severity {
-	switch s {
-	case "error", "ERROR", "Error", "e", "E":
-		return rdf.Severity_ERROR
-	case "warning", "WARNING", "Warning", "w", "W":
-		return rdf.Severity_WARNING
-	case "info", "INFO", "Info", "i", "I",
-		"note", "NOTE", "Note", "n", "N": // Treat note as info.
-		return rdf.Severity_INFO
-	default:
-		return rdf.Severity_UNKNOWN_SEVERITY
-	}
+	return rdf.ParseSeverity(s)
 }

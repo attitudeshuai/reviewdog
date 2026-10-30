@@ -17,6 +17,7 @@ import (
 	"github.com/reviewdog/reviewdog/diff"
 	"github.com/reviewdog/reviewdog/filter"
 	"github.com/reviewdog/reviewdog/parser"
+	"github.com/reviewdog/reviewdog/proto/rdf"
 )
 
 // RunAndParse runs commands and parse results. Returns map of tool name to check results.
@@ -63,9 +64,13 @@ func RunAndParse(ctx context.Context, conf *Config, runners map[string]bool, def
 			if err != nil {
 				return err
 			}
-			level := runner.Level
+			// A per-runner level takes precedence over the default level.
+			// Both go through the same severity word table and are stored in
+			// canonical form so every reporter sees the same level regardless
+			// of how it was spelled (case, whitespace, synonyms).
+			level := rdf.NormalizeLevel(runner.Level)
 			if level == "" {
-				level = defaultLevel
+				level = rdf.NormalizeLevel(defaultLevel)
 			}
 			cmdErr := cmd.Wait()
 			results.Store(runnerName, &reviewdog.Result{
