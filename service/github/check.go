@@ -55,6 +55,10 @@ type Check struct {
 
 	muResult sync.Mutex
 	result   *CheckResult
+
+	// annotationLimit is the optional per-run limit shared with other log
+	// writers. When nil, fallback log writers use standalone semantics.
+	annotationLimit *githubutils.AnnotationLimit
 }
 
 // CheckResult represents result of Check.
@@ -63,9 +67,20 @@ type CheckResult struct {
 	Conclusion string
 }
 
+// CheckOption configures a Check service.
+type CheckOption func(*Check)
+
+// WithCheckAnnotationLimit shares the per-run annotation limit with log
+// writers created when the check run falls back to logging commands.
+func WithCheckAnnotationLimit(l *githubutils.AnnotationLimit) CheckOption {
+	return func(ch *Check) {
+		ch.annotationLimit = l
+	}
+}
+
 // NewGitHubCheck returns a new Check service.
-func NewGitHubCheck(cli *github.Client, owner, repo string, pr int, sha, level, toolName string) (*Check, error) {
-	return &Check{
+func NewGitHubCheck(cli *github.Client, owner, repo string, pr int, sha, level, toolName string, opts ...CheckOption) (*Check, error) {
+	ch := &Check{
 		CLI:      cli,
 		Owner:    owner,
 		Repo:     repo,
@@ -73,7 +88,19 @@ func NewGitHubCheck(cli *github.Client, owner, repo string, pr int, sha, level, 
 		SHA:      sha,
 		Level:    level,
 		ToolName: toolName,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(ch)
+	}
+	return ch, nil
+}
+
+func (ch *Check) newLogWriter() *githubutils.GitHubActionLogWriter {
+	var opts []githubutils.Option
+	if ch.annotationLimit != nil {
+		opts = append(opts, githubutils.WithAnnotationLimit(ch.annotationLimit))
+	}
+	return githubutils.NewGitHubActionLogWriter(ch.Level, opts...)
 }
 
 // Post posts a reviewdog comment.
@@ -120,7 +147,7 @@ func (ch *Check) Flush(ctx context.Context) error {
 		// Pull Requests diff), so it should be ok not to return error here and
 		// return results instead.
 		if err, ok := err.(*github.ErrorResponse); ok && err.Response.StatusCode == http.StatusForbidden && cienv.IsInGitHubAction() {
-			logWriter := githubutils.NewGitHubActionLogWriter(ch.Level)
+			logWriter := ch.newLogWriter()
 			for _, c := range ch.postComments {
 				if !c.Result.ShouldReport {
 					continue

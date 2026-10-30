@@ -61,9 +61,24 @@ type PullRequest struct {
 	logWriter     *githubutils.GitHubActionLogWriter
 	fallbackToLog bool
 
+	// annotationLimit is the optional per-run limit shared with other log
+	// writers. When nil, fallback log writers use standalone semantics.
+	annotationLimit *githubutils.AnnotationLimit
+
 	postedcs           commentutil.PostedComments
 	outdatedComments   map[string]*github.PullRequestComment // fingerprint -> comment
 	prCommentWithReply map[int64]bool                        // review id -> bool
+}
+
+// PullRequestOption configures a PullRequest service.
+type PullRequestOption func(*PullRequest)
+
+// WithPullRequestAnnotationLimit shares the per-run annotation limit with the
+// log writers used when review comments fall back to logging commands.
+func WithPullRequestAnnotationLimit(l *githubutils.AnnotationLimit) PullRequestOption {
+	return func(g *PullRequest) {
+		g.annotationLimit = l
+	}
 }
 
 // NewGitHubPullRequest returns a new PullRequest service.
@@ -75,16 +90,28 @@ type PullRequest struct {
 //
 // [1]: https://docs.github.com/en/actions/security-guides/automatic-token-authentication#permissions-for-the-github_token
 // [2]: https://docs.github.com/en/actions/reference/workflow-commands-for-github-actions
-func NewGitHubPullRequest(cli *github.Client, owner, repo string, pr int, sha, level, toolName string) *PullRequest {
-	return &PullRequest{
-		cli:       cli,
-		owner:     owner,
-		repo:      repo,
-		pr:        pr,
-		sha:       sha,
-		toolName:  toolName,
-		logWriter: githubutils.NewGitHubActionLogWriter(level),
+func NewGitHubPullRequest(cli *github.Client, owner, repo string, pr int, sha, level, toolName string, opts ...PullRequestOption) *PullRequest {
+	g := &PullRequest{
+		cli:      cli,
+		owner:    owner,
+		repo:     repo,
+		pr:       pr,
+		sha:      sha,
+		toolName: toolName,
 	}
+	for _, opt := range opts {
+		opt(g)
+	}
+	g.logWriter = g.newLogWriter(level)
+	return g
+}
+
+func (g *PullRequest) newLogWriter(level string) *githubutils.GitHubActionLogWriter {
+	var opts []githubutils.Option
+	if g.annotationLimit != nil {
+		opts = append(opts, githubutils.WithAnnotationLimit(g.annotationLimit))
+	}
+	return githubutils.NewGitHubActionLogWriter(level, opts...)
 }
 
 // Post accepts a comment and holds it. Flush method actually posts comments to
@@ -112,7 +139,7 @@ func (g *PullRequest) Flush(ctx context.Context) error {
 
 func (g *PullRequest) SetTool(toolName string, level string) {
 	g.toolName = toolName
-	g.logWriter = githubutils.NewGitHubActionLogWriter(level)
+	g.logWriter = g.newLogWriter(level)
 }
 
 func (g *PullRequest) postAsReviewComment(ctx context.Context) error {

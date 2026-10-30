@@ -302,6 +302,12 @@ func run(r io.Reader, w io.Writer, opt *option) error {
 	var cs reviewdog.CommentService
 	var ds reviewdog.DiffService
 
+	// One annotation limit per run. It is shared by the direct annotation
+	// reporter and log writers created while GitHub reporters fall back to
+	// logging commands, so the dropped count and the over-limit warning are
+	// computed once over the whole run.
+	annotationLimit := githubutils.NewAnnotationLimit()
+
 	if isProject {
 		var err error
 		projectConf, err = projectConfig(opt.conf)
@@ -323,7 +329,7 @@ func run(r io.Reader, w io.Writer, opt *option) error {
 		}
 		var err error
 		var isPR bool
-		checkService, ghDiffService, isPR, err := githubCheckService(ctx, opt)
+		checkService, ghDiffService, isPR, err := githubCheckService(ctx, opt, annotationLimit)
 		if err != nil {
 			return err
 		}
@@ -335,7 +341,7 @@ func run(r io.Reader, w io.Writer, opt *option) error {
 	case "github-annotations", "github-pr-annotations":
 		var err error
 		var isPR bool
-		cs, ds, isPR, err = githubActionLogService(ctx, opt)
+		cs, ds, isPR, err = githubActionLogService(ctx, opt, annotationLimit)
 		if err != nil {
 			return err
 		}
@@ -343,7 +349,7 @@ func run(r io.Reader, w io.Writer, opt *option) error {
 			opt.filterMode = filter.ModeNoFilter
 		}
 	case "github-pr-review":
-		gs, isPR, err := githubService(ctx, opt)
+		gs, isPR, err := githubService(ctx, opt, annotationLimit)
 		if err != nil {
 			return err
 		}
@@ -452,17 +458,23 @@ func run(r io.Reader, w io.Writer, opt *option) error {
 		cs = reviewdog.NewSARIFCommentWriter(w, toolName(opt))
 	}
 
+	// Report buffered log annotations (if any) once the whole run is done so
+	// the per-step limit is enforced over all reporter instances of this run.
+	// The annotation count itself never makes the run fail, but a real write
+	// error is returned.
+	var runErr error
 	if isProject {
-		return project.Run(ctx, projectConf, buildRunnersMap(opt.runners), cs, ds, opt.tee, opt.filterMode, failLevel(opt))
-	}
+		runErr = project.Run(ctx, projectConf, buildRunnersMap(opt.runners), cs, ds, opt.tee, opt.filterMode, failLevel(opt))
+	} else {
+		p, err := newParserFromOpt(opt)
+		if err != nil {
+			return err
+		}
 
-	p, err := newParserFromOpt(opt)
-	if err != nil {
-		return err
+		app := reviewdog.NewReviewdog(toolName(opt), p, cs, ds, opt.filterMode, failLevel(opt))
+		runErr = app.Run(ctx, r)
 	}
-
-	app := reviewdog.NewReviewdog(toolName(opt), p, cs, ds, opt.filterMode, failLevel(opt))
-	return app.Run(ctx, r)
+	return errors.Join(runErr, annotationLimit.Flush(ctx))
 }
 
 func runList(w io.Writer) error {
@@ -634,7 +646,7 @@ func giteaClient(ctx context.Context, url, token string) (*gitea.Client, error) 
 	return client, client.CheckServerVersionConstraint(ctx, ">=1.17.0")
 }
 
-func githubService(ctx context.Context, opt *option) (gs *githubservice.PullRequest, isPR bool, err error) {
+func githubService(ctx context.Context, opt *option, annotationLimit *githubutils.AnnotationLimit) (gs *githubservice.PullRequest, isPR bool, err error) {
 	g, client, err := githubBuildInfoWithClient(ctx)
 	if err != nil {
 		return nil, false, err
@@ -656,11 +668,12 @@ func githubService(ctx context.Context, opt *option) (gs *githubservice.PullRequ
 		g.PullRequest = prID
 	}
 
-	gs = githubservice.NewGitHubPullRequest(client, g.Owner, g.Repo, g.PullRequest, g.SHA, opt.level, toolName(opt))
+	gs = githubservice.NewGitHubPullRequest(client, g.Owner, g.Repo, g.PullRequest, g.SHA, opt.level, toolName(opt),
+		githubservice.WithPullRequestAnnotationLimit(annotationLimit))
 	return gs, true, nil
 }
 
-func githubCheckService(ctx context.Context, opt *option) (reviewdog.CommentService, reviewdog.DiffService, bool, error) {
+func githubCheckService(ctx context.Context, opt *option, annotationLimit *githubutils.AnnotationLimit) (reviewdog.CommentService, reviewdog.DiffService, bool, error) {
 	g, client, err := githubBuildInfoWithClient(ctx)
 	if err != nil {
 		return nil, nil, false, err
@@ -676,14 +689,15 @@ func githubCheckService(ctx context.Context, opt *option) (reviewdog.CommentServ
 			FallBackToGitCLI: true,
 		}
 	}
-	cs, err := githubservice.NewGitHubCheck(client, g.Owner, g.Repo, g.PullRequest, g.SHA, opt.level, toolName(opt))
+	cs, err := githubservice.NewGitHubCheck(client, g.Owner, g.Repo, g.PullRequest, g.SHA, opt.level, toolName(opt),
+		githubservice.WithCheckAnnotationLimit(annotationLimit))
 	if err != nil {
 		return nil, nil, false, err
 	}
 	return cs, ds, g.PullRequest != 0, nil
 }
 
-func githubActionLogService(ctx context.Context, opt *option) (reviewdog.CommentService, reviewdog.DiffService, bool, error) {
+func githubActionLogService(ctx context.Context, opt *option, annotationLimit *githubutils.AnnotationLimit) (reviewdog.CommentService, reviewdog.DiffService, bool, error) {
 	g, client, err := githubBuildInfoWithClient(ctx)
 	if err != nil {
 		return nil, nil, false, err
@@ -699,7 +713,7 @@ func githubActionLogService(ctx context.Context, opt *option) (reviewdog.Comment
 			FallBackToGitCLI: true,
 		}
 	}
-	cs := githubutils.NewGitHubActionLogWriter(opt.level)
+	cs := githubutils.NewGitHubActionLogWriter(opt.level, githubutils.WithAnnotationLimit(annotationLimit))
 	return cs, ds, g.PullRequest != 0, nil
 }
 
