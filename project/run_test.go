@@ -38,6 +38,18 @@ func (f *fakeCommentService) Post(_ context.Context, c *reviewdog.Comment) error
 
 func (*fakeCommentService) ShouldPrependGitRelDir() bool { return false }
 
+type fakeNamedCommentService struct {
+	fakeCommentService
+	tools []string
+}
+
+func (f *fakeNamedCommentService) SetTool(toolName, _ string) {
+	// project.Run reports results sequentially; recording the SetTool calls
+	// captures the order in which reports are built, independent of when each
+	// command finished.
+	f.tools = append(f.tools, toolName)
+}
+
 func TestRun(t *testing.T) {
 	ctx := context.Background()
 
@@ -366,4 +378,180 @@ func TestFilteredEnviron(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestRunAndParseDuplicateRunnerName(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name    string
+		runners map[string]*Runner
+		wantErr string
+	}{
+		{
+			name: "explicit name collision",
+			runners: map[string]*Runner{
+				// Give the config keys in reverse message order to prove the
+				// error names them deterministically.
+				"key-b": {Name: "dup", Cmd: "echo b", Errorformat: []string{`%f:%l:%c:%m`}},
+				"key-a": {Name: "dup", Cmd: "echo a", Errorformat: []string{`%f:%l:%c:%m`}},
+			},
+			wantErr: `duplicate runner name "dup": config keys "key-a" and "key-b" resolve to the same name`,
+		},
+		{
+			name: "explicit name collides with another config key",
+			runners: map[string]*Runner{
+				"other": {Name: "alpha", Cmd: "echo o", Errorformat: []string{`%f:%l:%c:%m`}},
+				"alpha": {Cmd: "echo a", Errorformat: []string{`%f:%l:%c:%m`}},
+			},
+			wantErr: `duplicate runner name "alpha": config keys "alpha" and "other" resolve to the same name`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conf := &Config{Runner: tt.runners}
+			_, err := RunAndParse(ctx, conf, nil, "", false)
+			if err == nil {
+				t.Fatal("want duplicate runner name error, got nil")
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("error = %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunAndParseDuplicateRunnerNameFailsBeforeStartingCommands(t *testing.T) {
+	ctx := context.Background()
+	conf := &Config{Runner: map[string]*Runner{
+		// Commands that would hang if they were ever started.
+		"key-a": {Name: "dup", Cmd: "cat", Errorformat: []string{`%f:%l:%c:%m`}},
+		"key-b": {Name: "dup", Cmd: "cat", Errorformat: []string{`%f:%l:%c:%m`}},
+	}}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := RunAndParse(ctx, conf, nil, "", false)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "duplicate runner name") {
+			t.Fatalf("want duplicate runner name error before commands start, got: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("RunAndParse hung; commands must not start when runner names conflict")
+	}
+}
+
+func TestCheckUnknownRunnerSorted(t *testing.T) {
+	err := checkUnknownRunner(map[string]bool{"c": true, "a": true, "b": true}, nil)
+	if err == nil {
+		t.Fatal("want runner not found error, got nil")
+	}
+	if got, want := err.Error(), "runner not found: [a,b,c]"; got != want {
+		t.Errorf("error = %q, want %q", got, want)
+	}
+
+	if err := checkUnknownRunner(map[string]bool{"a": true}, []string{"a"}); err != nil {
+		t.Errorf("all specified runners used: got %v, want nil", err)
+	}
+	if err := checkUnknownRunner(nil, nil); err != nil {
+		t.Errorf("no specified runners: got %v, want nil", err)
+	}
+}
+
+func TestRunAndParseResultOrderIndependentOfCompletionOrder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX sleep utility")
+	}
+
+	conf := &Config{Runner: map[string]*Runner{
+		// "alpha" finishes well after "zeta" when jobs run in parallel.
+		"slow-config-key": {
+			Name:        "alpha",
+			Cmd:         "sleep 0.3; echo 'slow:1:1:done'",
+			Errorformat: []string{`%f:%l:%c:%m`},
+		},
+		"fast-config-key": {
+			Name:        "zeta",
+			Cmd:         "echo 'fast:1:1:done'",
+			Errorformat: []string{`%f:%l:%c:%m`},
+		},
+	}}
+
+	want := []string{"alpha", "zeta"}
+	// Running the same input twice must always yield the same name order.
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		results, err := RunAndParse(ctx, conf, nil, "", false)
+		cancel()
+		if err != nil {
+			t.Fatalf("RunAndParse failed: %v", err)
+		}
+		var got []string
+		results.Range(func(name string, _ *reviewdog.Result) {
+			got = append(got, name)
+		})
+		if len(got) != len(want) {
+			t.Fatalf("got %d results %v, want %d %v", len(got), got, len(want), want)
+		}
+		if !stringsEqual(got, want) {
+			t.Errorf("run %d: result order = %v, want %v (must not depend on completion order)", i+1, got, want)
+		}
+	}
+}
+
+func TestRunReportOrderIndependentOfCompletionOrder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX sleep utility")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ds := &fakeDiffService{
+		FakeDiff: func() ([]byte, error) {
+			return []byte(""), nil
+		},
+	}
+	cs := &fakeNamedCommentService{
+		fakeCommentService: fakeCommentService{
+			FakePost: func(_ *reviewdog.Comment) error { return nil },
+		},
+	}
+	conf := &Config{Runner: map[string]*Runner{
+		"slow-config-key": {
+			Name:        "alpha",
+			Cmd:         "sleep 0.3",
+			Errorformat: []string{`%f:%l:%c:%m`},
+		},
+		"fast-config-key": {
+			Name:        "zeta",
+			Cmd:         "echo done",
+			Errorformat: []string{`%f:%l:%c:%m`},
+		},
+	}}
+
+	if err := Run(ctx, conf, nil, cs, ds, false, filter.ModeAdded, reviewdog.FailLevelNone); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"alpha", "zeta"}
+	if !stringsEqual(cs.tools, want) {
+		t.Errorf("report order = %v, want %v (must be sorted by name, not completion time)", cs.tools, want)
+	}
+}
+
+func stringsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

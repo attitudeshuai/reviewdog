@@ -3,6 +3,7 @@ package reviewdog
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/reviewdog/reviewdog/filter"
@@ -57,11 +58,24 @@ func (rm *ResultMap) Load(key string) (*Result, error) {
 }
 
 // Range retrieves `key` and `values` from ResultMap iteratively.
+//
+// Keys are visited in lexicographic byte order (not collation/locale order),
+// so that report order is deterministic and independent of the order in which
+// concurrent jobs finished. The values themselves are not copied or reordered.
 func (rm *ResultMap) Range(f func(key string, val *Result)) {
-	rm.sm.Range(func(k, v interface{}) bool {
-		f(k.(string), v.(*Result))
+	var keys []string
+	rm.sm.Range(func(k, _ interface{}) bool {
+		keys = append(keys, k.(string))
 		return true
 	})
+	sort.Strings(keys)
+	for _, key := range keys {
+		v, ok := rm.sm.Load(key)
+		if !ok {
+			continue
+		}
+		f(key, v.(*Result))
+	}
 }
 
 // Len returns the length of ResultMap count. Len() is not yet officially not supported by Go. (ref: https://github.com/golang/go/issues/20680)

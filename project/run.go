@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 
 	"golang.org/x/sync/errgroup"
@@ -21,6 +22,9 @@ import (
 
 // RunAndParse runs commands and parse results. Returns map of tool name to check results.
 func RunAndParse(ctx context.Context, conf *Config, runners map[string]bool, defaultLevel string, teeMode bool) (*reviewdog.ResultMap, error) {
+	if err := checkDuplicateRunnerName(conf.Runner); err != nil {
+		return nil, err
+	}
 	var results reviewdog.ResultMap
 	// environment variables for each commands
 	envs := filteredEnviron()
@@ -156,7 +160,29 @@ func checkUnknownRunner(specifiedRunners map[string]bool, usedRunners []string) 
 		rs = append(rs, r)
 	}
 	if len(specifiedRunners) != 0 {
+		// Sort by name so the error message is identical regardless of map
+		// iteration order or whether names came from the CLI or the config.
+		sort.Strings(rs)
 		return fmt.Errorf("runner not found: [%s]", strings.Join(rs, ","))
+	}
+	return nil
+}
+
+// checkDuplicateRunnerName makes sure resolved runner names (config key or
+// explicit `name`) are unique. It must be called before any command starts,
+// because results are keyed by name and a later result would silently
+// overwrite an earlier one otherwise.
+func checkDuplicateRunnerName(runners map[string]*Runner) error {
+	configKeyByName := make(map[string]string, len(runners))
+	for key, runner := range runners {
+		name := getRunnerName(key, runner)
+		if existingKey, ok := configKeyByName[name]; ok {
+			keys := []string{existingKey, key}
+			sort.Strings(keys)
+			return fmt.Errorf("duplicate runner name %q: config keys %q and %q resolve to the same name",
+				name, keys[0], keys[1])
+		}
+		configKeyByName[name] = key
 	}
 	return nil
 }
